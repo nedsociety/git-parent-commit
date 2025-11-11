@@ -1,0 +1,409 @@
+#!/usr/bin/env -S uv --quiet run --script
+# /// script
+# requires-python = ">=3.8"
+# dependencies = [
+#   "typer[all]>=0.9.0",
+#   "loguru>=0.7.0",
+# ]
+# ///
+
+"""
+Finds the latest commit in a parent repository that is compatible
+with a specific version of a submodule repository.
+
+Compatibility is defined by a set of paths ("P-paths"). A commit in the submodule
+is considered "P-compatible" with a target commit A if there is no diff
+between them when looking only at those specific paths.
+
+This script works in two phases:
+1. Find the "P-Compatibility Window": A set of all consecutive commits
+   in the submodule repo (ancestors and descendants of A) that are
+    P-compatible with A.
+2. Find the Latest Parent Commit: Search the history of the parent repo
+   (newest to oldest) to find the first commit whose submodule points to
+   any commit within the P-Compatibility Window.
+"""
+
+# This script is managed by `uv` per the header above.
+# To run it, `uv` will automatically create a virtual environment
+# and install dependencies if needed.
+
+import subprocess
+import sys
+import typer
+from pathlib import Path
+from typing import List, Set, Optional
+from loguru import logger
+
+# Configure logger to output to stderr
+logger.remove()
+logger.add(sys.stderr, format="{level.icon} {message}", level="INFO")
+
+# Create the app
+app = typer.Typer()
+
+def run_git_command(command: List[str], cwd: Path) -> str:
+    """
+    Runs a Git command in a specified directory and returns its stdout.
+    Raises an exception if the command fails.
+    """
+    try:
+        # logger.debug(f"Running: {' '.join(command)} in {cwd}")
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding='utf-8'
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error running command: {' '.join(command)}")
+        logger.error(f"Working Directory: {cwd}")
+        logger.error(f"Return Code: {e.returncode}")
+        logger.error(f"Stdout: {e.stdout}")
+        logger.error(f"Stderr: {e.stderr}")
+        raise
+    except FileNotFoundError:
+        logger.critical(f"Error: 'git' command not found. Is Git installed and in your PATH?")
+        raise
+
+def check_p_compatibility(
+    repo_path: Path,
+    commit_a: str,
+    commit_b: str,
+    paths: List[str]
+) -> bool:
+    """
+    Checks if two commits are P-compatible (no diff in the specified paths).
+    Returns True if compatible (no diff), False if incompatible (diff).
+    """
+    command = ["git", "diff", "--quiet", f"{commit_a}..{commit_b}", "--"] + paths
+    try:
+        # We don't use run_git_command because --quiet exits with 1 on diff,
+        # which our helper would interpret as an error.
+        result = subprocess.run(
+            command,
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            encoding='utf-8'
+        )
+        # Exit code 0 means no diff (compatible)
+        # Exit code 1 means diff (incompatible)
+        return result.returncode == 0
+    except subprocess.CalledProcessError as e:
+        # Any other exit code is a real error
+        logger.error(f"Error checking diff: {' '.join(command)}")
+        logger.error(f"Stderr: {e.stderr}")
+        raise
+
+def find_compatible_submodule_commits(
+    submodule_repo_path: Path,
+    target_submodule_commit: str,
+    submodule_branch: str,
+    paths_to_check: List[str]
+) -> Set[str]:
+    """
+    PHASE 1: Finds the "P-Compatibility Window" in the submodule repository.
+    """
+    logger.info(f"--- Phase 1: Finding P-Compatibility Window in Submodule Repo ---")
+    logger.info(f"Target Submodule commit: {target_submodule_commit}")
+    
+    # Resolve the target commit to a full hash
+    try:
+        full_target_submodule_hash = run_git_command(["git", "rev-parse", target_submodule_commit], submodule_repo_path)
+    except subprocess.CalledProcessError:
+        logger.error(f"Error: Target Submodule commit '{target_submodule_commit}' not found in {submodule_repo_path}")
+        raise typer.Exit(code=1)
+        
+    logger.info(f"Full Submodule hash: {full_target_submodule_hash}")
+    compatible_set = {full_target_submodule_hash}
+
+    # 1. Search "up" (descendants / newer commits)
+    logger.info(f"Searching descendants of {target_submodule_commit} (on {submodule_branch})...")
+    try:
+        # Get list of descendants, oldest first (closest to target)
+        descendant_list_cmd = ["git", "rev-list", "--reverse", f"{full_target_submodule_hash}..{submodule_branch}"]
+        descendants = run_git_command(descendant_list_cmd, submodule_repo_path)
+        
+        for commit in descendants.splitlines():
+            if not commit: continue
+            if check_p_compatibility(submodule_repo_path, full_target_submodule_hash, commit, paths_to_check):
+                # logger.debug(f"  [+] {commit[:10]} is compatible.")
+                compatible_set.add(commit)
+            else:
+                logger.debug(f"  [-] {commit[:10]} is incompatible. Stopping descendant search.")
+                break # Stop at the first incompatible commit
+                
+    except subprocess.CalledProcessError:
+        logger.warning(f"Could not get descendants. Maybe '{submodule_branch}' is behind '{target_submodule_commit}'?")
+
+    # 2. Search "down" (ancestors / older commits)
+    logger.info(f"Searching ancestors of {target_submodule_commit}...")
+    try:
+        # Get list of ancestors, newest first (starts with target)
+        ancestor_list_cmd = ["git", "rev-list", full_target_submodule_hash]
+        ancestors = run_git_command(ancestor_list_cmd, submodule_repo_path)
+        
+        # Skip the first commit (it's the target itself, already in the set)
+        for commit in ancestors.splitlines()[1:]:
+            if not commit: continue
+            if check_p_compatibility(submodule_repo_path, full_target_submodule_hash, commit, paths_to_check):
+                # logger.debug(f"  [+] {commit[:10]} is compatible.")
+                compatible_set.add(commit)
+            else:
+                logger.debug(f"  [-] {commit[:10]} is incompatible. Stopping ancestor search.")
+                break # Stop at the first incompatible commit
+                
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error getting ancestors: {e.stderr}")
+        # We can probably continue, but the set will be incomplete.
+        pass
+
+    logger.info(f"--- Found {len(compatible_set)} compatible submodule commits. ---")
+    return compatible_set
+
+def find_latest_parent_commit(
+    parent_repo_path: Path,
+    parent_branch: str,
+    submodule_path: str,
+    compatible_submodule_set: Set[str],
+    limit_search_depth: Optional[int]
+) -> str | None:
+    """
+    PHASE 2: Finds the latest commit in the parent repo that points to a compatible submodule commit.
+    """
+    logger.info(f"--- Phase 2: Searching for latest compatible parent commit ---")
+    logger.info(f"Searching branch '{parent_branch}' in {parent_repo_path}")
+
+    # Get all commits in Parent, newest to oldest
+    parent_commit_list_cmd = ["git", "rev-list", parent_branch]
+    parent_commits = run_git_command(parent_commit_list_cmd, parent_repo_path)
+    num_parent_commits = len(parent_commits.splitlines())
+    logger.info(f"Found {num_parent_commits} parent commits on branch '{parent_branch}'")
+    if (limit_search_depth is not None) and (limit_search_depth < num_parent_commits):
+        logger.info(f"Limiting search to {limit_search_depth} commits")
+        parent_commits = parent_commits.splitlines()[:limit_search_depth]
+    else:
+        logger.info(f"Searching all {num_parent_commits} parent commits")
+        parent_commits = parent_commits.splitlines()
+
+    for parent_commit in parent_commits:
+        if not parent_commit: continue
+
+        # For this Parent commit, find the Submodule commit hash it points to.
+        ls_tree_cmd = ["git", "ls-tree", parent_commit, "--", submodule_path]
+        try:
+            ls_output = run_git_command(ls_tree_cmd, parent_repo_path)
+            if not ls_output:
+                # This commit doesn't have the submodule at this path
+                continue
+            
+            # Output format: <mode> <type> <hash> <path>
+            parts = ls_output.split()
+            if len(parts) < 3:
+                continue
+                
+            submodule_hash = parts[2]
+
+            # This is the core check
+            if submodule_hash in compatible_submodule_set:
+                logger.success(f"Found latest compatible parent commit.")
+                logger.success(f"  Parent Commit:  {parent_commit}")
+                logger.success(f"  Points to Submodule: {submodule_hash}")
+                return parent_commit
+
+        except subprocess.CalledProcessError:
+            # This commit probably doesn't have the submodule path.
+            # This is normal for old history, so just continue.
+            # logger.debug(f"  [Info] Skipping parent commit {parent_commit[:7]}: Submodule path '{submodule_path}' not found.")
+            continue
+            
+    logger.warning(f"NOT FOUND: No parent commit on branch '{parent_branch}' was found pointing to a compatible submodule commit.")
+    return None
+
+
+@app.command(no_args_is_help=True)
+def main(
+    parent_repo: Path = typer.Option(
+        ".",
+        "-P", "--parent-repo",
+        help="Path to the service (parent) repository clone.",
+        rich_help_panel="Repository Arguments",
+        resolve_path=True
+    ),
+    submodule_path: Path = typer.Option(
+        ...,
+        "-s", "--submodule-path",
+        help="The relative path to the submodule *within* the parent repository (e.g., 'third_party/protocols').",
+        rich_help_panel="Parent Repo Arguments"
+    ),
+    target_submodule_commit: str = typer.Option(
+        ...,
+        "-c", "--target-submodule-commit",
+        help="The target commit in the submodule repo to check compatibility against (e.g., hash, branch, tag).",
+        rich_help_panel="Submodule Repo Arguments"
+    ),
+    submodule_repo: Optional[Path] = typer.Option(
+        None,
+        "--submodule-repo",
+        help="Path to the protocol (submodule) repository clone. "
+             "If not provided, it defaults to the --submodule-path inside --parent-repo. "
+             "This default behavior requires the submodule to be a full clone.",
+        rich_help_panel="Repository Arguments",
+        resolve_path=True
+    ),
+    parent_branch: Optional[str] = typer.Option(
+        None,
+        "-B", "--parent-branch",
+        help="The branch in the parent repo to search. "
+             "If not provided, defaults to the currently checked-out branch.",
+        rich_help_panel="Parent Repo Arguments"
+    ),
+    submodule_branch: Optional[str] = typer.Option(
+        None,
+        "-b", "--submodule-branch",
+        help="The branch in the submodule repo to search for descendants. "
+             "If not provided, defaults to the same branch as --parent-branch.",
+        rich_help_panel="Submodule Repo Arguments"
+    ),
+    paths: Optional[List[str]] = typer.Option(
+        None,
+        "-p", "--paths",
+        help="One or more paths *within the submodule repo* that the parent service cares about. "
+             "If not provided, defaults to '.' (the entire submodule).",
+        rich_help_panel="P-Paths Argument"
+    ),
+    show_git_tree: bool = typer.Option(
+        False,
+        "-t", "--show-git-tree",
+        help="Show the Git tree of the submodule repo.",
+        rich_help_panel="Output Arguments"
+    ),
+    limit_search_depth: Optional[int] = typer.Option(
+        None,
+        "-l", "--limit-search-depth",
+        help="Limit the search to the specified number of parent commits. If not provided, defaults to 1000.",
+        rich_help_panel="Search Arguments"
+    ),
+    no_limit_search_depth: bool = typer.Option(
+        False,
+        "-L", "--no-limit-search-depth",
+        help="Do not limit the search to the specified number of parent commits.",
+        rich_help_panel="Search Arguments"
+    ),
+):
+    """
+    Finds the latest parent commit compatible with a submodule commit.
+    """
+
+    # --- Set final values for arguments ---
+    
+    # Default paths to check
+    paths_to_check = paths if paths else ["."]
+
+    # Resolve parent repo path
+    parent_repo_path = parent_repo.resolve()
+    if not parent_repo_path.is_dir():
+        logger.error(f"Error: Parent repo path not found: {parent_repo_path}")
+        raise typer.Exit(code=1)
+
+    # Resolve parent-branch default
+    if parent_branch is None:
+        try:
+            current_branch = run_git_command(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                parent_repo_path
+            )
+            if current_branch == 'HEAD':
+                logger.error("Error: --parent-branch not specified and parent repo is in a detached HEAD state.")
+                logger.error("Please specify a branch with -B or --parent-branch.")
+                raise typer.Exit(code=1)
+            parent_branch = current_branch
+            logger.info(f"Using detected parent branch: {parent_branch}")
+        except subprocess.CalledProcessError as e:
+            logger.error("Error: Could not detect current branch for parent repo.")
+            logger.error(f"Details: {e.stderr}")
+            logger.error("Please specify a branch with -B or --parent-branch.")
+            raise typer.Exit(code=1)
+
+    # Resolve submodule-branch default
+    if submodule_branch is None:
+        submodule_branch = parent_branch
+        logger.info(f"Using '{submodule_branch}' for --submodule-branch (same as parent).")
+
+    if no_limit_search_depth:
+        limit_search_depth = None
+    elif limit_search_depth:
+        limit_search_depth = limit_search_depth
+    else:
+        limit_search_depth = 1000
+
+    # Resolve submodule repo path
+    if submodule_repo:
+        # Submodule repo path was provided explicitly
+        submodule_repo_path = submodule_repo.resolve()
+    else:
+        # Submodule repo path was *not* provided, use default
+        submodule_repo_path = (parent_repo_path / submodule_path).resolve()
+        logger.info(f"--submodule-repo not specified. Defaulting to submodule path:")
+        logger.info(f"  {submodule_repo_path}")
+        logger.info("  This will only work if the submodule is a full clone (not a shallow one).")
+
+    if not submodule_repo_path.is_dir():
+        logger.error(f"Error: Submodule repo path not found: {submodule_repo_path}")
+        logger.error("  If using the default, ensure the submodule is initialized and is a directory.")
+        raise typer.Exit(code=1)
+
+    # --- Verify guessed submodule branch exists ---
+    try:
+        run_git_command(
+            ["git", "rev-parse", "--verify", submodule_branch],
+            submodule_repo_path
+        )
+    except subprocess.CalledProcessError:
+        logger.error(
+            f"Error: The submodule branch '{submodule_branch}' (defaulted from parent) "
+            f"does not seem to exist in the submodule repo at:"
+        )
+        logger.error(f"  {submodule_repo_path}")
+        logger.error("Please specify a valid branch with -b or --submodule-branch.")
+        raise typer.Exit(code=1)
+
+
+    # Phase 1
+    compatible_submodule_set = find_compatible_submodule_commits(
+        submodule_repo_path=submodule_repo_path,
+        target_submodule_commit=target_submodule_commit,
+        submodule_branch=submodule_branch,
+        paths_to_check=paths_to_check
+    )
+    
+    if not compatible_submodule_set:
+        logger.error(f"Error: Could not even find the target submodule commit. Exiting.")
+        raise typer.Exit(code=1)
+        
+    # Phase 2
+    latest_parent_commit = find_latest_parent_commit(
+        parent_repo_path=parent_repo_path,
+        parent_branch=parent_branch,
+        submodule_path=str(submodule_path), # Pass path as string to git
+        compatible_submodule_set=compatible_submodule_set,
+        limit_search_depth=limit_search_depth
+    )
+    
+    # --- Final Output ---
+    if latest_parent_commit:
+        if show_git_tree:
+            git_tree_cmd = ["git", "log", "--graph", "--oneline", latest_parent_commit]
+            # Exiting git log with `q` usually ends with nonzero exit code, so we don't check it
+            subprocess.run(git_tree_cmd, cwd=parent_repo_path, check=False)
+        else:            
+            print(latest_parent_commit)
+    else:
+        raise typer.Exit(code=1) # Exit with error if not found
+
+if __name__ == "__main__":
+    app()
