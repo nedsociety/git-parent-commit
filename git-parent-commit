@@ -397,6 +397,13 @@ def main(
         logger.error("Please specify a valid branch with -b or --submodule-branch.")
         raise typer.Exit(code=1)
 
+    # Sanitize target_submodule_commit by finding mergbe-base with the submodule branch
+    logger.info(f"Finding merge-base of {submodule_branch} and {target_submodule_commit}")
+    target_submodule_commit = run_git_command(
+        ["git", "merge-base", submodule_branch, target_submodule_commit],
+        submodule_repo_path
+    )
+    logger.info(f"Merge-base: {target_submodule_commit}")
 
     # Find the transition commit
     latest_parent_commit = find_transition_parent_commit(
