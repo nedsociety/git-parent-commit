@@ -4,7 +4,7 @@ Finds the latest commit in a parent repository that is compatible with a specifi
 
 ## Installation
 
-1. Install uv first.
+1. Install prerequisites.
 2. Download and install the script using the following commands:
 
 ```bash
