@@ -12,8 +12,6 @@ wget https://github.com/nedsociety/git-parent-commit/raw/refs/heads/main/git-par
 sudo install -m 755 git-parent-commit /usr/local/bin/git-parent-commit
 ```
 
-After installation, the script will be available as `git-parent-commit` in your PATH.
-
 ## Requirements
 
 - Python 3.8 or higher
